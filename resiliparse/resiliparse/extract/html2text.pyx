@@ -21,7 +21,7 @@ from libcpp.memory cimport make_shared, shared_ptr
 from libcpp.string cimport string, to_string
 from libcpp.vector cimport vector
 
-from resiliparse_common.string_util cimport lstrip_str, rstrip_str, strip_str, strip_sv
+from resiliparse_common.string_util cimport lstrip_str, rstrip_str, strip_str, strip_sv, normalize_whitespace
 from resiliparse_inc.cctype cimport isspace
 from resiliparse.parse.html cimport *
 from resiliparse_inc.lexbor cimport *
@@ -911,3 +911,255 @@ cdef string _extract_plain_text_impl(HTMLTree tree,
         ctx.node = next_node(ctx.root_node, ctx.node, &ctx.depth, &is_end_tag)
 
     return rstrip_str(_serialize_extract_nodes(extract_nodes, ctx.opts, <size_t>(chars_extracted * 1.2)))
+
+
+# 定义段落相关的常量
+cdef stl_set[lxb_tag_id_t] PARAGRAPH_TAGS = {
+    LXB_TAG_BODY, LXB_TAG_BLOCKQUOTE, LXB_TAG_CAPTION, LXB_TAG_CENTER, LXB_TAG_COL,
+    LXB_TAG_COLGROUP, LXB_TAG_DD, LXB_TAG_DIV, LXB_TAG_DL, LXB_TAG_DT,
+    LXB_TAG_FIELDSET, LXB_TAG_FORM, LXB_TAG_LEGEND, LXB_TAG_OPTGROUP, LXB_TAG_OPTION,
+    LXB_TAG_P, LXB_TAG_PRE, LXB_TAG_TABLE, LXB_TAG_TD, LXB_TAG_TEXTAREA,
+    LXB_TAG_TFOOT, LXB_TAG_TH, LXB_TAG_THEAD, LXB_TAG_TR, LXB_TAG_UL, LXB_TAG_LI,
+    LXB_TAG_H1, LXB_TAG_H2, LXB_TAG_H3, LXB_TAG_H4, LXB_TAG_H5, LXB_TAG_H6
+}
+
+# 定义用于清理 DOM 树的黑名单标签
+cdef stl_set[lxb_tag_id_t] KILL_TAGS = {LXB_TAG_HEAD, LXB_TAG_SCRIPT, LXB_TAG_STYLE}
+
+# 表示段落的结构体
+cdef struct Paragraph:
+    vector[string] text_nodes
+    string dom_path
+    size_t chars_count_in_links
+    size_t tags_count
+
+# 检查字符串是否为空或只包含空白字符
+cdef bint is_blank(const string& s) noexcept nogil:
+    """
+    检查字符串是否为空或只包含空白字符
+    
+    参数:
+        s: 要检查的字符串
+        
+    返回:
+        bint: 如果字符串为空或只包含空白字符则返回True，否则返回False
+    """
+    if s.empty():
+        return True
+
+    for i in range(s.size()):
+        if not isspace(s[i]):
+            return False
+   
+    return True
+
+# 清理 DOM 树，去除不需要的元素
+cdef void clean_dom_tree(lxb_dom_node_t* node) noexcept nogil:
+    cdef lxb_dom_node_t* cur = node
+    cdef lxb_dom_node_t* next_node_ptr
+    while cur != NULL:
+        next_node_ptr = cur.next
+        if cur.type == LXB_DOM_NODE_TYPE_ELEMENT:
+            if KILL_TAGS.find(cur.local_name) != KILL_TAGS.end():
+                lxb_dom_node_destroy(cur)
+            else:
+                clean_dom_tree(cur.first_child)
+        elif cur.type == LXB_DOM_NODE_TYPE_COMMENT:
+            lxb_dom_node_destroy(cur)
+        cur = next_node_ptr
+
+cdef string join_path_nogil(const vector[string]& path_parts, const string& delimiter) nogil:
+    """
+    Join a vector of strings with a delimiter without acquiring the GIL.
+    
+    :param path_parts: Vector of string parts to join
+    :param delimiter: Delimiter to insert between parts
+    :return: Joined string
+    """
+    cdef string result
+    cdef size_t i
+    cdef size_t n = path_parts.size()
+    
+    if n == 0:
+        return result
+    
+    # 预估结果字符串的大小以减少重新分配
+    cdef size_t total_size = 0
+    for i in range(n):
+        total_size += path_parts[i].size()
+    
+    # 加上分隔符的长度 (n-1 个分隔符)
+    if n > 1:
+        total_size += delimiter.size() * (n - 1)
+    
+    # 预分配内存
+    result.reserve(total_size)
+    
+    # 拼接字符串
+    result = path_parts[0]
+    for i in range(1, n):
+        result += delimiter
+        result += path_parts[i]
+    
+    return result
+
+# 段落提取的核心逻辑
+cdef class ParagraphExtractor:
+    cdef vector[Paragraph] paragraphs
+    cdef vector[string] dom_paths
+    cdef Paragraph current_paragraph
+    cdef vector[tuple[string, size_t, stl_set[string]]] path_elements  # (tag_name, order, children)
+    cdef bint in_link
+    cdef bint br_flag
+
+    def __init__(self):
+        self.paragraphs.clear()
+        self.dom_paths.clear()
+        self.path_elements.clear()
+        self.in_link = False
+        self.br_flag = False
+        self._start_new_paragraph(string(<char*>b'start_dom'))
+
+    cdef void _start_new_paragraph(self, string dom_path) noexcept nogil:
+        if self.current_paragraph.text_nodes.size() > 0:
+            self.paragraphs.push_back(self.current_paragraph)
+        self.current_paragraph = Paragraph(
+            text_nodes=vector[string](),
+            dom_path=dom_path,
+            chars_count_in_links=0,
+            tags_count=0,
+        )
+        self.br_flag = False
+
+    cdef void append_text(self, const string& content, bint check_blank) noexcept nogil:
+        cdef string clean_content
+        clean_content = normalize_whitespace(content)
+        if check_blank and is_blank(clean_content):
+            return
+
+        self.current_paragraph.text_nodes.push_back(clean_content)
+        if self.in_link:
+            self.current_paragraph.chars_count_in_links += clean_content.size()
+        self.br_flag = False
+
+    cdef void process_node(self, lxb_dom_node_t* node, bint is_end_tag) noexcept nogil:
+        cdef string tag_name
+        cdef lxb_dom_character_data_t* char_data
+        if node.type == LXB_DOM_NODE_TYPE_ELEMENT:
+            tag_name = string(<const char*>lxb_dom_element_qualified_name(<lxb_dom_element_t*>node, NULL))
+            
+            # 处理无文本也需要处理的节点
+            if node.local_name == LXB_TAG_BR:
+                if self.br_flag:
+                    # 保持 dom_path 和 深度
+                    self._start_new_paragraph(self.current_paragraph.dom_path)
+                else:
+                    self.append_text(b" ", False)
+                self.br_flag = True
+            
+            # 如果无子节点，肯定也没有文本，直接跳过
+            if not node.first_child:
+                return
+
+            # 处理有子节点的情况，如果有子节点说明肯定会进入&退出各一次
+
+            # 进入，当前为element node，准备进text节点
+            if not is_end_tag:
+                self.dom_paths.push_back(tag_name)
+                if PARAGRAPH_TAGS.find(node.local_name) != PARAGRAPH_TAGS.end():
+                    self._start_new_paragraph(join_path_nogil(self.dom_paths, b"."))
+                else:
+                    if node.local_name == LXB_TAG_A:
+                        self.in_link = True
+                    self.current_paragraph.tags_count += 1
+            # 退出，上一个访问的是 last_child，准备继续往上走
+            else:
+                self.dom_paths.pop_back()
+                # 如果是 PARAGRAPH_TAGS 退出，封装，回到上一个的tag
+                if PARAGRAPH_TAGS.find(node.local_name) != PARAGRAPH_TAGS.end():
+                    self._start_new_paragraph(join_path_nogil(self.dom_paths, b"."))
+                if node.local_name == LXB_TAG_A:
+                    self.in_link = False
+
+        # 文本就添加
+        elif node.type == LXB_DOM_NODE_TYPE_TEXT:
+            char_data = <lxb_dom_character_data_t*>node
+            self.append_text(string(<const char*>char_data.data.data, char_data.data.length), True)
+
+    cdef vector[Paragraph] extract(self, HTMLTree tree, string skip_selector) noexcept nogil:
+        cdef lxb_dom_node_t* root = <lxb_dom_node_t*>tree.dom_document.body
+        cdef lxb_dom_node_t* node = root
+        cdef size_t depth = 0
+        cdef bint is_end_tag = False
+
+        #clean_dom_tree(root)  # 清理 DOM 树
+
+        # Select all blacklisted elements and store them in a set
+        cdef lxb_dom_collection_t* blacklist_coll = query_selector_all_impl(root, tree,
+                                                                            skip_selector.data(), skip_selector.size(), 30)
+        cdef stl_set[lxb_dom_node_t*] blacklisted_nodes
+        if blacklist_coll != NULL:
+            for i in range(lxb_dom_collection_length(blacklist_coll)):
+                blacklisted_nodes.insert(lxb_dom_collection_node(blacklist_coll, i))
+            lxb_dom_collection_destroy(blacklist_coll, True)
+
+        while node:
+            if (node.type != LXB_DOM_NODE_TYPE_ELEMENT and node.type != LXB_DOM_NODE_TYPE_TEXT) or \
+                blacklisted_nodes.find(node) != blacklisted_nodes.end():
+                is_end_tag = True
+                node = next_node(root, node, &depth, &is_end_tag)
+                continue
+            self.process_node(node, is_end_tag)
+            node = next_node(root, node, &depth, &is_end_tag)
+
+        self._start_new_paragraph(string(<char*>b'end_dom'))  # 结束时保存最后一个段落
+        return self.paragraphs
+
+# Python 接口
+def extract_paragraphs(html):
+    """
+    从 HTML 中提取段落。
+
+    :param html: 输入的 HTML 字符串或 HTMLTree 对象
+    :return: 提取的段落列表，每个段落包含 dom_path, xpath, text_nodes 等信息
+    """
+    cdef HTMLTree tree
+    if isinstance(html, str):
+        tree = HTMLTree.parse(html)
+    elif isinstance(html, HTMLTree):
+        tree = <HTMLTree>html
+    else:
+        raise TypeError("Parameter 'html' must be a string or HTMLTree.")
+
+    cdef ParagraphExtractor extractor = ParagraphExtractor()
+    cdef vector[Paragraph] paragraphs
+
+    skip_selectors = {b'script', b'style', b'button', b'input', b'select', b'textarea', b'applet', b'iframe'}
+    #skip_selectors = {e.encode() for e in skip_elements or []}
+    # script,style,button,input,select,textarea,applet
+    #skip_selectors = {b'script', b'style', b'iframe', b'frame', b'template', b'applet'}
+    #skip_selectors.update({b'textarea', b'input', b'button', b'select', b'option', b'label'})
+    """
+    if not alt_texts:
+        skip_selectors.update({b'object', b'video', b'audio', b'embed' b'img', b'area',
+                            b'svg', b'figcaption', b'figure'})
+    if not noscript:
+        skip_selectors.add(b'noscript')
+    if not form_fields:
+        skip_selectors.update({b'textarea', b'input', b'button', b'select', b'option', b'label'})
+    """
+    cdef string skip_selector = <string>b','.join(skip_selectors)
+
+    with nogil:
+        paragraphs = extractor.extract(tree, skip_selector)
+
+    result = []
+    for p in paragraphs:
+        text_nodes = [n.decode('utf-8', errors='replace') for n in p.text_nodes]
+        result.append({
+            'text_nodes': text_nodes,
+            'dom_path': p.dom_path.decode('utf-8', errors='replace'),
+            'chars_count_in_links': p.chars_count_in_links,
+            'tags_count': p.tags_count,
+        })
+    return result

@@ -85,6 +85,39 @@ cdef extern from * nogil:
         }
         return s;
     }
+
+    std::string normalize_whitespace(const std::string& text) {
+        std::string result;
+        result.reserve(text.length());
+        
+        bool in_whitespace = false;
+        char last_whitespace = ' ';
+        
+        for (size_t i = 0; i < text.length(); i++) {
+            char c = text[i];
+            
+            if (std::isspace(static_cast<unsigned char>(c))) {
+                if (!in_whitespace) {
+                    in_whitespace = true;
+                    last_whitespace = (c == '\\n' || c == '\\r') ? '\\n' : ' ';
+                } else if ((c == '\\n' || c == '\\r') && last_whitespace != '\\n') {
+                    last_whitespace = '\\n';
+                }
+            } else {
+                if (in_whitespace) {
+                    result.push_back(last_whitespace);
+                    in_whitespace = false;
+                }
+                result.push_back(c);
+            }
+        }
+        
+        if (in_whitespace) {
+            result.push_back(last_whitespace);
+        }
+        
+        return result;
+    }
     """
 
     cdef size_t rstrip_c_str(const char** s_ptr, size_t l)
@@ -94,6 +127,8 @@ cdef extern from * nogil:
     cdef string lstrip_str(string s)
     cdef string rstrip_str(string s)
     cdef string strip_str(string s)
+
+    cdef string normalize_whitespace(const string& text) nogil
 
 
 cdef inline string_view strip_sv(string_view s) noexcept nogil:
