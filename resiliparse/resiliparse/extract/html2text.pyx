@@ -912,6 +912,7 @@ cdef string _extract_plain_text_impl(HTMLTree tree,
 
     return rstrip_str(_serialize_extract_nodes(extract_nodes, ctx.opts, <size_t>(chars_extracted * 1.2)))
 
+cdef stl_set[string] HEAD_STR_TAGS = {b'h1', b'h2', b'h3', b'h4', b'h5', b'h6'}
 
 # 定义段落相关的常量
 cdef stl_set[lxb_tag_id_t] PARAGRAPH_TAGS = {
@@ -932,6 +933,7 @@ cdef struct Paragraph:
     string dom_path
     size_t chars_count_in_links
     size_t tags_count
+    size_t head_tag_count
 
 # 检查字符串是否为空或只包含空白字符
 cdef bint is_blank(const string& s) noexcept nogil:
@@ -1011,6 +1013,7 @@ cdef class ParagraphExtractor:
     cdef vector[tuple[string, size_t, stl_set[string]]] path_elements  # (tag_name, order, children)
     cdef bint in_link
     cdef bint br_flag
+    cdef bint head_tag_count
 
     def __init__(self):
         self.paragraphs.clear()
@@ -1028,6 +1031,7 @@ cdef class ParagraphExtractor:
             dom_path=dom_path,
             chars_count_in_links=0,
             tags_count=0,
+            head_tag_count=self.head_tag_count,
         )
         self.br_flag = False
 
@@ -1065,8 +1069,10 @@ cdef class ParagraphExtractor:
 
             # 进入，当前为element node，准备进text节点
             if not is_end_tag:
-                self.dom_paths.push_back(tag_name)
                 if PARAGRAPH_TAGS.find(node.local_name) != PARAGRAPH_TAGS.end():
+                    self.dom_paths.push_back(tag_name)
+                    if HEAD_STR_TAGS.find(tag_name) != HEAD_STR_TAGS.end():
+                        self.head_tag_count += 1
                     self._start_new_paragraph(join_path_nogil(self.dom_paths, b"."))
                 else:
                     if node.local_name == LXB_TAG_A:
@@ -1074,9 +1080,12 @@ cdef class ParagraphExtractor:
                     self.current_paragraph.tags_count += 1
             # 退出，上一个访问的是 last_child，准备继续往上走
             else:
-                self.dom_paths.pop_back()
+                
                 # 如果是 PARAGRAPH_TAGS 退出，封装，回到上一个的tag
                 if PARAGRAPH_TAGS.find(node.local_name) != PARAGRAPH_TAGS.end():
+                    if HEAD_STR_TAGS.find(self.dom_paths.back()) != HEAD_STR_TAGS.end():
+                        self.head_tag_count -= 1
+                    self.dom_paths.pop_back()
                     self._start_new_paragraph(join_path_nogil(self.dom_paths, b"."))
                 if node.local_name == LXB_TAG_A:
                     self.in_link = False
@@ -1161,5 +1170,6 @@ def extract_paragraphs(html):
             'dom_path': p.dom_path.decode('utf-8', errors='replace'),
             'chars_count_in_links': p.chars_count_in_links,
             'tags_count': p.tags_count,
+            "head_tag_count": p.head_tag_count
         })
     return result
