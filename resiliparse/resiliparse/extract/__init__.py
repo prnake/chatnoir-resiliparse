@@ -11,3 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from resiliparse.extract.lexbor_justext import lexbor_justext
+from resiliparse.extract.hybrid_justext import hybrid_justext
