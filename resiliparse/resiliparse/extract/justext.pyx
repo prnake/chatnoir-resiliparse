@@ -293,18 +293,20 @@ cdef void revise_paragraph_classification_fast(vector[Paragraph]& paragraphs, si
     cdef size_t n = paragraphs.size()
     cdef size_t i
     cdef Paragraph* p
-    cdef size_t distance
-    cdef vector[size_t] next_good_pos
-    cdef vector[size_t] next_good_or_bad
-    cdef vector[size_t] next_good_or_bad_or_neargood
-    cdef vector[size_t] prev_good_or_bad
-    cdef vector[size_t] prev_good_or_bad_or_neargood
-    cdef size_t prev_idx
-    cdef size_t next_idx
+    cdef int distance
+    cdef vector[int] next_good_pos
+    cdef vector[int] next_good_or_bad
+    cdef vector[int] next_good_or_bad_or_neargood
+    cdef vector[int] prev_good_or_bad
+    cdef vector[int] prev_good_or_bad_or_neargood
+    cdef vector[int] new_classes
+    cdef vector[int] distance_prefix_sum
+    cdef int prev_idx
+    cdef int next_idx
     cdef int prev_neighbour
     cdef int next_neighbour
-    cdef size_t prev_neargood_idx
-    cdef size_t next_neargood_idx
+    cdef int prev_neargood_idx
+    cdef int next_neargood_idx
     cdef int prev_with_neargood
     cdef int next_with_neargood
 
@@ -312,31 +314,35 @@ cdef void revise_paragraph_classification_fast(vector[Paragraph]& paragraphs, si
     for i in range(n):
         paragraphs[i].class_type = paragraphs[i].cf_class
 
-    # 预计算 next_good_pos 用于标题处理
-    
     next_good_pos.resize(n, n)
+    next_good_or_bad.resize(n, n)
+    next_good_or_bad_or_neargood.resize(n, n)
+    prev_good_or_bad.resize(n, -1)
+    prev_good_or_bad_or_neargood.resize(n, -1)
+    new_classes.resize(n, -1)
+    distance_prefix_sum.resize(n + 1, 0)
+
+    for i in range(n):
+        p = &paragraphs[i]
+        distance_prefix_sum[i+1] = distance_prefix_sum[i] + p.text_py_length
+
     for i in range(n-1, -1, -1):
         if paragraphs[i].class_type == CLASS_GOOD:
             next_good_pos[i] = i
         elif i < n-1:
             next_good_pos[i] = next_good_pos[i+1]
+        else:
+            next_good_pos[i] = n
 
     # 步骤 1: 处理好的标题
     for i in range(n):
         p = &paragraphs[i]
+
         if p.is_heading and p.cf_class == CLASS_SHORT:
             if i + 1 < n and next_good_pos[i + 1] < n:
-                distance = 0
-                for k in range(i + 1, next_good_pos[i + 1]):
-                    distance += paragraphs[k].text.size()
+                distance = distance_prefix_sum[next_good_pos[i + 1]] - distance_prefix_sum[i + 1]
                 if distance <= max_heading_distance:
                     p.class_type = CLASS_NEARGOOD
-
-    # 预计算邻居索引
-    next_good_or_bad.resize(n, n)
-    next_good_or_bad_or_neargood.resize(n, n)
-    prev_good_or_bad.resize(n, <size_t>-1)
-    prev_good_or_bad_or_neargood.resize(n, <size_t>-1)
 
     for i in range(n-2, -1, -1):
         if paragraphs[i+1].class_type in [CLASS_GOOD, CLASS_BAD]:
@@ -363,40 +369,43 @@ cdef void revise_paragraph_classification_fast(vector[Paragraph]& paragraphs, si
     # 步骤 2: 分类短段落
     for i in range(n):
         p = &paragraphs[i]
-        if p.class_type != CLASS_SHORT:
-            continue
-        prev_idx = next_good_or_bad[i]
-        next_idx = prev_good_or_bad[i]
-        prev_neighbour = paragraphs[prev_idx].class_type if prev_idx < n else CLASS_BAD
-        next_neighbour = paragraphs[next_idx].class_type if next_idx < n else CLASS_BAD
-        if prev_neighbour == CLASS_GOOD and next_neighbour == CLASS_GOOD:
-            p.class_type = CLASS_GOOD
-        elif prev_neighbour == CLASS_BAD and next_neighbour == CLASS_BAD:
-            p.class_type = CLASS_BAD
-        else:
-            prev_neargood_idx = next_good_or_bad_or_neargood[i]
-            next_neargood_idx = prev_good_or_bad_or_neargood[i]
-            prev_with_neargood = paragraphs[prev_neargood_idx].class_type if prev_neargood_idx < n else CLASS_BAD
-            next_with_neargood = paragraphs[next_neargood_idx].class_type if next_neargood_idx < n else CLASS_BAD
-            if (prev_neighbour == CLASS_BAD and prev_with_neargood == CLASS_NEARGOOD) or \
-               (next_neighbour == CLASS_BAD and next_with_neargood == CLASS_NEARGOOD):
+        if p.class_type == CLASS_SHORT:
+            prev_idx = next_good_or_bad[i]
+            next_idx = prev_good_or_bad[i]
+            prev_neighbour = paragraphs[prev_idx].class_type if prev_idx >= 0 and prev_idx < n else CLASS_BAD
+            next_neighbour = paragraphs[next_idx].class_type if next_idx >= 0 and next_idx < n else CLASS_BAD
+            if prev_neighbour == CLASS_GOOD and next_neighbour == CLASS_GOOD:
                 p.class_type = CLASS_GOOD
-            else:
+            elif prev_neighbour == CLASS_BAD and next_neighbour == CLASS_BAD:
                 p.class_type = CLASS_BAD
+            else:
+                prev_neargood_idx = next_good_or_bad_or_neargood[i]
+                next_neargood_idx = prev_good_or_bad_or_neargood[i]
+                prev_with_neargood = paragraphs[prev_neargood_idx].class_type if prev_neargood_idx >= 0 and prev_neargood_idx < n else CLASS_BAD
+                next_with_neargood = paragraphs[next_neargood_idx].class_type if next_neargood_idx >= 0 and next_neargood_idx < n else CLASS_BAD
+                if (prev_neighbour == CLASS_BAD and prev_with_neargood == CLASS_NEARGOOD) or \
+                (next_neighbour == CLASS_BAD and next_with_neargood == CLASS_NEARGOOD):
+                    new_classes[i] = CLASS_GOOD
+                else:
+                    new_classes[i] = CLASS_BAD
+
+    for i in range(n):
+        if new_classes[i] != -1:
+            p = &paragraphs[i]
+            p.class_type = new_classes[i]
 
     # 步骤 3: 修订 neargood 段落
     for i in range(n):
         p = &paragraphs[i]
-        if p.class_type != CLASS_NEARGOOD:
-            continue
-        prev_idx = next_good_or_bad[i]
-        next_idx = prev_good_or_bad[i]
-        prev_neighbour = paragraphs[prev_idx].class_type if prev_idx < n else CLASS_BAD
-        next_neighbour = paragraphs[next_idx].class_type if next_idx < n else CLASS_BAD
-        if prev_neighbour == CLASS_BAD and next_neighbour == CLASS_BAD:
-            p.class_type = CLASS_BAD
-        else:
-            p.class_type = CLASS_GOOD
+        if p.class_type == CLASS_NEARGOOD:
+            prev_idx = next_good_or_bad[i]
+            next_idx = prev_good_or_bad[i]
+            prev_neighbour = paragraphs[prev_idx].class_type if prev_idx >= 0 and prev_idx < n else CLASS_BAD
+            next_neighbour = paragraphs[next_idx].class_type if next_idx >= 0 and next_idx < n else CLASS_BAD
+            if prev_neighbour == CLASS_BAD and next_neighbour == CLASS_BAD:
+                p.class_type = CLASS_BAD
+            else:
+                p.class_type = CLASS_GOOD
 
     # 步骤 4: 处理更多好的标题
     for i in range(n-1, -1, -1):
@@ -404,17 +413,16 @@ cdef void revise_paragraph_classification_fast(vector[Paragraph]& paragraphs, si
             next_good_pos[i] = i
         elif i < n-1:
             next_good_pos[i] = next_good_pos[i+1]
+        else:
+            next_good_pos[i] = n
 
     for i in range(n):
         p = &paragraphs[i]
-        if not (p.is_heading and p.class_type == CLASS_BAD and p.cf_class != CLASS_BAD):
-            continue
-        if i + 1 < n and next_good_pos[i + 1] < n:
-            distance = 0
-            for k in range(i + 1, next_good_pos[i + 1]):
-                distance += paragraphs[k].text.size()
-            if distance <= max_heading_distance:
-                p.class_type = CLASS_GOOD
+        if p.is_heading and p.class_type == CLASS_BAD and p.cf_class != CLASS_BAD:  
+            if i + 1 < n and next_good_pos[i + 1] < n:
+                distance = distance_prefix_sum[next_good_pos[i + 1]] - distance_prefix_sum[i + 1]
+                if distance <= max_heading_distance:
+                    p.class_type = CLASS_GOOD
 
 # 主提取函数
 cdef vector[Paragraph] _extract_paragraphs_impl(vector[Paragraph]& paragraphs, HTMLTree tree, stl_set[string]& stoplist,
