@@ -112,6 +112,8 @@ def get_ext_modules():
                   sources=[f'resiliparse/itertools.pyx'], **cpp_args),
         Extension('resiliparse.extract.html2text',
                   sources=[f'resiliparse/extract/html2text.pyx'], libraries=['lexbor', 're2'], **cpp_args),
+        Extension('resiliparse.extract.justext',
+                  sources=[f'resiliparse/extract/justext.pyx'], libraries=['lexbor', 're2'], **cpp_args),
         Extension('resiliparse.parse.encoding',
                   sources=[f'resiliparse/parse/encoding.pyx'], libraries=['uchardet', 'lexbor'], **cpp_args),
         Extension('resiliparse.parse.html',
