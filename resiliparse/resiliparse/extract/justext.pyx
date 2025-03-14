@@ -524,6 +524,9 @@ def justext(html, stoplist=None, language="English", length_low=70, length_high=
     with nogil:
         extractor.extract(tree, skip_selector)
 
+    if extractor.paragraphs.size() == 0:
+        return []
+    
     for i in range(extractor.paragraphs.size()):
         text_nodes = [n.decode('utf-8', errors='replace') for n in extractor.paragraphs[i].text_nodes]
         py_text = py_normalize_whitespace("".join([node for node in text_nodes if (not py_is_blank(node)) or node == " "]).strip())
